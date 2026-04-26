@@ -20,6 +20,7 @@ import { SessionManager } from '../session/session-manager.js';
 import { buildSnapshot, type SnapshotFormat } from '../snapshot/snapshot.js';
 import { diffSnapshots } from '../snapshot/diff.js';
 import { holdKey, typeText, waitForIdle, waitForText } from '../session/wait.js';
+import { runScript, RunScriptInputSchema } from './script-runner.js';
 
 import {
     captureAround,
@@ -265,6 +266,33 @@ export function buildTools(manager: SessionManager): ToolDefinition[] {
             }),
         },
 
+        // ── run_script ────────────────────────────────────────────────
+        {
+            name: 'run_script',
+            description:
+                'Execute an ordered multi-step control + observation script against one session ' +
+                'inside the MCP server before returning. This is the latency bridge for serious ' +
+                'TUI automation: send keys/text/raw bytes, type slowly, hold keys, wait for text, ' +
+                'wait for idle, sleep, assert visible/raw output, resize, and take snapshots as ' +
+                'one atomic tool call. Each observable step can return before/after screen text, ' +
+                'a row-level diff, and an inline waitFor result. The whole script can also record ' +
+                'frame-level monitor output while the steps run, so agents can catch fast transient ' +
+                'states that would disappear between separate tool calls.\n\n' +
+                'Use this instead of separate send_* → wait_for_text → get_text round trips when ' +
+                'you need precise closed-loop control: e.g. send Enter, wait until "Loading…" ' +
+                'appears, send another key immediately when "Ready" appears, assert a final line, ' +
+                'and return all observed frames/snapshots in one result. The input is a structured ' +
+                'JSON action DSL rather than arbitrary Python/JS, making it safe and reliable for ' +
+                'agents to generate.',
+            inputSchema: RunScriptInputSchema,
+            handler: async (input) => safely('run_script', async () => {
+                const payload = await runScript(manager, input);
+                const result = json(payload as unknown as Record<string, unknown>);
+                if (!payload.ok) result.isError = true;
+                return result;
+            }),
+        },
+
         // ── send_keys ─────────────────────────────────────────────────
         {
             name: 'send_keys',
@@ -283,7 +311,9 @@ export function buildTools(manager: SessionManager): ToolDefinition[] {
                 'then timed to the moment the pattern first matched. Use this to catch ' +
                 'transient post-input states (spinners resolving, prompts flashing, streamed ' +
                 'output settling) that might otherwise disappear before a follow-up ' +
-                '`wait_for_text` tool call could reach them.',
+                '`wait_for_text` tool call could reach them.\n\n' +
+                'For multi-step flows, use `run_script`: it can send keys/text, wait/assert, ' +
+                'record frames, and return all intermediate observations in one tool call.',
             inputSchema: {
                 sessionId: SessionIdField,
                 keys: z.union([KeyInputSchema, z.array(KeyInputSchema)])
@@ -346,7 +376,10 @@ export function buildTools(manager: SessionManager): ToolDefinition[] {
                 'TIP: pass `waitFor: { pattern: "..." }` to submit the text AND wait for a ' +
                 'specific response to appear on screen in a single round-trip — perfect for ' +
                 'issuing a command and capturing its reply before it scrolls or a spinner ' +
-                'overwrites it.',
+                'overwrites it.\n\n' +
+                'For chains like type → wait → send another key → assert final output, prefer ' +
+                '`run_script` so the server performs every step and monitor sample without ' +
+                'agent round-trip latency.',
             inputSchema: {
                 sessionId: SessionIdField,
                 text: z.string().describe('The literal text to send.'),
@@ -392,7 +425,8 @@ export function buildTools(manager: SessionManager): ToolDefinition[] {
                 'or send_text in normal use. By default returns a `screen` block with the ' +
                 'terminal text before and after the bytes were written plus a row-level diff.\n\n' +
                 'TIP: pass `waitFor: { pattern: "..." }` to submit the bytes AND wait for a ' +
-                'specific expected result on screen in one call.',
+                'specific expected result on screen in one call. For multi-step raw-byte flows ' +
+                'with monitoring and assertions, use `run_script`.',
             inputSchema: {
                 sessionId: SessionIdField,
                 hex: z.string().optional().describe('Bytes as hex (e.g. "1b5b41" for ESC [ A).'),
@@ -456,7 +490,8 @@ export function buildTools(manager: SessionManager): ToolDefinition[] {
                 'it ended plus a row-level diff.\n\n' +
                 'TIP: pass `waitFor: { pattern: "..." }` to poll for an expected end-state ' +
                 'as soon as the hold ends (e.g. "scrolled to top" marker), which avoids ' +
-                'racing a follow-up `wait_for_text`.',
+                'racing a follow-up `wait_for_text`. For hold → wait → send/assert chains, ' +
+                'use `run_script` to keep every step inside one server-side observation loop.',
             inputSchema: {
                 sessionId: SessionIdField,
                 key: KeyInputSchema.describe('Key spec to repeat.'),
@@ -508,7 +543,8 @@ export function buildTools(manager: SessionManager): ToolDefinition[] {
                 'plus a row-level diff.\n\n' +
                 'TIP: pass `waitFor: { pattern: "..." }` to wait for a specific trigger ' +
                 'line (autocomplete popup, form validation, prompt response, etc.) to appear ' +
-                'right after typing finishes — the after-snapshot is timed to the first match.',
+                'right after typing finishes — the after-snapshot is timed to the first match. ' +
+                'For realistic typing followed by several waits/actions, use `run_script`.',
             inputSchema: {
                 sessionId: SessionIdField,
                 text: z.string(),
@@ -648,7 +684,10 @@ export function buildTools(manager: SessionManager): ToolDefinition[] {
             name: 'wait_for_text',
             description:
                 'Block until a pattern appears on screen (or in the raw output buffer). ' +
-                'Resolves with the matched text + elapsed ms, or returns an error on timeout.',
+                'Resolves with the matched text + elapsed ms, or returns an error on timeout. ' +
+                'When the wait is part of a larger interaction, prefer `run_script` so the ' +
+                'server can wait and immediately perform the next action without an agent ' +
+                'round-trip.',
             inputSchema: {
                 sessionId: SessionIdField,
                 pattern: z.string().describe('String to search for.'),
@@ -727,7 +766,9 @@ export function buildTools(manager: SessionManager): ToolDefinition[] {
             description:
                 'Begin recording frame-level diffs of a session at a configurable rate. ' +
                 'Returns a monitorId; call stop_monitor later to retrieve the frame log. ' +
-                'Use this to observe animations, spinners, or any incremental UI change.',
+                'Use this to observe animations, spinners, or any incremental UI change. For ' +
+                'one-call flows, `run_script` can start an internal whole-script monitor and ' +
+                'return its frames automatically.',
             inputSchema: {
                 sessionId: SessionIdField,
                 intervalMs: z.number().int().positive().max(5_000).optional().describe('Sampling interval. Default 100 (≈10 Hz).'),

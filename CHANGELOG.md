@@ -10,9 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Initial public release of the tui-tester MCP server.
-- 19 MCP tools covering session lifecycle, input, output, waiting,
+- 20 MCP tools covering session lifecycle, input, output, waiting,
   monitoring, and resizing:
     - `start_session`, `stop_session`, `list_sessions`
+    - `run_script`
     - `send_keys`, `send_text`, `send_raw`, `hold_key`, `type_text`
     - `snapshot`, `get_text`, `get_cursor`, `get_raw_output`, `get_exit_info`
     - `wait_for_text`, `wait_for_idle`
@@ -28,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   states that would otherwise disappear before a follow-up
   `wait_for_text` call could reach them. Supports literal substrings
   and regular expressions (with capture groups).
+- `run_script` executes multi-step input/wait/assert/snapshot flows inside
+  one MCP tool call, with optional whole-script frame monitoring and raw
+  output capture to remove round-trip races.
 - Optional `visible: true` viewer window that mirrors the PTY into a
   real OS terminal on macOS and Linux.
 - Full `includeScrollback` support on `snapshot` / `get_text` — the

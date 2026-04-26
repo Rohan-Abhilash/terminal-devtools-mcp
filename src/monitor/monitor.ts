@@ -99,37 +99,39 @@ export class Monitor {
     start(): void {
         if (this.timer !== null || this.stopped) return;
         this.startAt = Date.now();
-        const tick = async () => {
-            if (this.stopped) return;
-            try {
-                await this.session.whenParserFlushed();
-                const snap = buildSnapshot(this.session.terminal, 'text');
-                const diff = diffSnapshots(this.prevSnapshot, snap);
-                const changed = !diff.identical;
-                if (changed || this.keepIdentical) {
-                    const frame: MonitorFrame = {
-                        takenAt: snap.takenAt,
-                        offsetMs: snap.takenAt - this.startAt,
-                        changed,
-                        text: snap.text,
-                        cursor: { ...snap.cursor },
-                        diff,
-                    };
-                    this.frames.push(frame);
-                    while (this.frames.length > this.maxFrames) {
-                        this.frames.shift();
-                        this.truncated = true;
-                    }
-                }
-                this.prevSnapshot = snap;
-            } catch {
-                // Snapshot failed (session maybe exited) — just skip this tick.
-            }
-        };
         // Kick off an immediate sample so callers see frame 0 within one
         // interval rather than two.
-        void tick();
-        this.timer = setInterval(tick, this.intervalMs);
+        void this.sampleNow();
+        this.timer = setInterval(() => void this.sampleNow(), this.intervalMs);
+    }
+
+    async sampleNow(): Promise<void> {
+        if (this.stopped) return;
+        try {
+            await this.session.whenParserFlushed();
+            if (this.stopped) return;
+            const snap = buildSnapshot(this.session.terminal, 'text');
+            const diff = diffSnapshots(this.prevSnapshot, snap);
+            const changed = !diff.identical;
+            if (changed || this.keepIdentical) {
+                const frame: MonitorFrame = {
+                    takenAt: snap.takenAt,
+                    offsetMs: snap.takenAt - this.startAt,
+                    changed,
+                    text: snap.text,
+                    cursor: { ...snap.cursor },
+                    diff,
+                };
+                this.frames.push(frame);
+                while (this.frames.length > this.maxFrames) {
+                    this.frames.shift();
+                    this.truncated = true;
+                }
+            }
+            this.prevSnapshot = snap;
+        } catch {
+            // Snapshot failed (session maybe exited) — just skip this tick.
+        }
     }
 
     /** Stop sampling and return the recorded frames. */

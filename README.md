@@ -16,6 +16,7 @@ Think "Chrome DevTools MCP, but for TUIs". If an AI can test a web app by drivin
 | **Every key combination** | "ctrl+c", "ctrl+shift+up", "F5", "alt+enter", "shift+tab", "cmd+k" — parsed into canonical `KeySpec`s and encoded as the exact bytes a real xterm-compatible terminal emits (CSI + SS3 with modifier bitfields). |
 | **Before/after on every input** | Every `send_keys` / `send_text` / `send_raw` / `hold_key` / `type_text` call returns a `screen` block with the terminal text *before* the input, *after* it, and a row-level diff of exactly what changed. No separate snapshot round-trip needed. |
 | **Inline `waitFor`** | Any input tool can optionally `waitFor` a specific text (or regex) to appear on screen *before the call returns*, and the `after` snapshot is timed to the exact frame it first matched. Agents never miss transient post-input states (resolved spinners, one-shot prompts, streaming output that settles) that would otherwise disappear before a follow-up `wait_for_text` could land. |
+| **One-call scripts** | `run_script` executes a whole sequence inside the MCP server: send input, wait for text, wait for idle, assert text, sleep, resize, snapshot, record frames, and return raw output/final state. This removes the latency gap between separate tool calls and lets agents react to fast-changing screens deterministically. |
 | **Rendered-screen snapshots** | Bytes go through `@xterm/headless`, the same terminal emulator VS Code uses. You get the cursor position, text grid, per-cell colours, bold/italic/underline, everything. Pass `includeScrollback: true` on `snapshot` / `get_text` to also retrieve the full output buffer — every line ever rendered, not just what's currently on screen. |
 | **Frame-level monitoring** | Record diffs of the screen at a configurable poll rate and inspect animations, spinners, streaming output, or anything that changes over time. |
 | **Visible viewer window** | **Recommended default for every interactive session.** `visible: true` opens a real macOS/Linux terminal window that mirrors the PTY byte-for-byte so the human can watch the agent drive the TUI live. Tool descriptions instruct AI agents to opt in by default; only skip it for headless / CI runs. |
@@ -117,6 +118,139 @@ Kill a session. Default `SIGTERM`, escalates to `SIGKILL`.
 
 #### `list_sessions`
 Every session the server is tracking, with its lifecycle state, pid, exit code, bytes out, etc.
+
+---
+
+### Multi-step scripts — `run_script`
+
+`run_script` is the high-leverage tool for agents. It executes an ordered JSON script *inside the MCP server* before returning, so the agent does not lose fast transient states to MCP/client round-trip latency.
+
+Use it whenever a flow looks like:
+
+```
+send input → wait for text → immediately send another key → assert final screen → return all observed frames
+```
+
+Example:
+
+```jsonc
+{
+  "sessionId": "tui-xxx",
+  "defaults": {
+    "timeoutMs": 5000,
+    "pollIntervalMs": 25
+  },
+  "monitor": {
+    "intervalMs": 25,
+    "maxFrames": 500
+  },
+  "includeRawOutput": true,
+  "steps": [
+    {
+      "type": "send_text",
+      "label": "submit command",
+      "text": "build\n",
+      "waitFor": { "pattern": "Loading" }
+    },
+    {
+      "type": "wait_for_text",
+      "label": "wait until complete",
+      "pattern": "Compiled successfully"
+    },
+    {
+      "type": "send_keys",
+      "label": "open details",
+      "keys": "Enter",
+      "waitFor": { "pattern": "Build details" }
+    },
+    {
+      "type": "assert_text",
+      "pattern": "0 errors"
+    },
+    {
+      "type": "snapshot",
+      "includeScrollback": true
+    }
+  ]
+}
+```
+
+Response shape:
+
+```jsonc
+{
+  "sessionId": "tui-xxx",
+  "ok": true,
+  "stepsPlanned": 5,
+  "stepsRun": 5,
+  "stoppedAtStep": null,
+  "durationMs": 1234,
+  "results": [
+    {
+      "index": 0,
+      "type": "send_text",
+      "label": "submit command",
+      "ok": true,
+      "elapsedMs": 180,
+      "result": {
+        "bytesSent": 6,
+        "screen": { "before": { "text": "…" }, "after": { "text": "…" }, "diff": { "changedLines": [] } },
+        "waitFor": { "matched": true, "match": "Loading", "elapsedMs": 42 }
+      }
+    }
+  ],
+  "monitor": {
+    "frameCount": 12,
+    "frames": [
+      { "offsetMs": 0, "changed": true, "text": "…" },
+      { "offsetMs": 50, "changed": true, "text": "Loading…" }
+    ]
+  },
+  "rawOutput": {
+    "bytes": 123,
+    "output": "…",
+    "truncated": false
+  },
+  "finalSnapshot": {
+    "text": "Build details\n0 errors\n…"
+  }
+}
+```
+
+Available step types:
+
+| Step type | Purpose |
+|---|---|
+| `send_keys` | Send one key or a key array. Accepts the same key syntax as the standalone tool. |
+| `send_text` | Send literal text. |
+| `send_raw` | Send one of `hex`, `base64`, or `utf8`. |
+| `type_text` | Type text with per-character delay (`cps`). |
+| `hold_key` | Simulate key repeat for `durationMs`. |
+| `wait_for_text` | Wait for literal/regex text on visible screen or raw output. Defaults to failing the step on timeout. |
+| `wait_for_idle` | Wait until output is quiet for `idleMs`. |
+| `sleep` | Delay inside the server-side script. |
+| `assert_text` | Immediately assert text/regex is present, or absent with `negate: true`. The result reports `passed`, `matched`, `match`, `pattern`, `matchedAgainst`, `negated`, `textLength`, plus a small `excerpt` around the match (default 200 bytes; set `excerptBytes: 0` to omit). The full haystack is omitted by default to keep payloads small — pass `includeText: true` if you want the entire screen / raw output echoed back. |
+| `snapshot` | Return a rendered snapshot (`text`, `ansi`, `cells`, or `all`). |
+| `get_text` | Return a text snapshot with optional scrollback. |
+| `resize` | Resize the PTY and emulator together. |
+
+Observable steps (`send_*`, `type_text`, `hold_key`, `wait_for_text`, `wait_for_idle`, `sleep`) accept:
+
+| Option | Meaning |
+|---|---|
+| `captureScreen` | Include before/after/diff for that step. Defaults to `defaults.captureScreen`, then true. |
+| `waitAfterMs` | Settle delay before after-snapshot. Defaults to `defaults.waitAfterMs`, then the step default. |
+| `waitFor` | For input steps only: poll for a literal/regex pattern after the input lands. |
+
+Failure behaviour:
+
+| Option | Meaning |
+|---|---|
+| `stopOnError` | Global default is true. Stops at the first failed step. |
+| `continueOnError` | Step-level override; continues even when that step fails. |
+| `errorOnTimeout` | For nested input `waitFor`, default false. For `wait_for_text` steps, default true. |
+
+`run_script` intentionally uses a structured JSON DSL rather than arbitrary Python/JavaScript. It gives agents the same expressive control over the terminal while keeping execution bounded, inspectable, and safe for an MCP server.
 
 ---
 

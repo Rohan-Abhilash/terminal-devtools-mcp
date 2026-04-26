@@ -54,6 +54,7 @@ describe('tools — discoverability', () => {
         const names = new Set(tools.map((t) => t.name));
         for (const expected of [
             'start_session', 'stop_session', 'list_sessions',
+            'run_script',
             'send_keys', 'send_text', 'send_raw',
             'hold_key', 'type_text',
             'snapshot', 'get_text', 'get_cursor',
